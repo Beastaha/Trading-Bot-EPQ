@@ -1,0 +1,280 @@
+# Testing set of 5 weeks with aggregate results
+# Need to test RR and EMAs and RSI
+# STRATEGY SUBROUTINE
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from datetime import datetime, timedelta
+
+def run_strategy(data, params):
+    # Calculate indicators
+    data.loc[:, 'EMA_short'] = data['Close'].ewm(span=params['ema_short'], adjust=False).mean()
+    data['EMA_long'] = data['Close'].ewm(span=params['ema_long'], adjust=False).mean()
+
+    def calculate_rsi(prices, period):
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        return 100 - (100 / (1 + (gain/loss)))
+
+    data['RSI'] = calculate_rsi(data['Close'], params['rsi_period'])
+
+    # Signal generation
+    data['Signal'] = 0
+    cross_up = (data['EMA_short'] > data['EMA_long']) & (data['EMA_short'].shift(1) <= data['EMA_long'].shift(1))
+    cross_down = (data['EMA_short'] < data['EMA_long']) & (data['EMA_short'].shift(1) >= data['EMA_long'].shift(1))
+
+    for i in range(1, len(data)):
+        if cross_up.iloc[i] and not cross_down.iloc[i]:
+            data.at[i, 'Signal'] = 1
+        elif cross_down.iloc[i] and not cross_up.iloc[i]:
+            data.at[i, 'Signal'] = -1
+
+    # RSI filtering
+    data.loc[(data['Signal'] == 1) & (data['RSI'] > params['rsi_overbought']), 'Signal'] = 0
+    data.loc[(data['Signal'] == -1) & (data['RSI'] < params['rsi_oversold']), 'Signal'] = 0
+
+    # Trading simulation
+    initial_capital = 10000
+    capital = initial_capital
+    position = 0
+    entry_price = 0
+    trade_results = []
+    executed_indices = []
+
+    for i in range(1, len(data)):
+        current_price = data['Close'].iloc[i].item()
+
+        if position == 0 and data['Signal'].iloc[i] != 0:
+            executed_indices.append(i)
+            if data['Signal'].iloc[i] == 1:  # Buy
+                position = 1
+                entry_price = current_price
+                stop_loss = entry_price * (1 - params['stop_loss_pct'])
+                take_profit = entry_price * (1 + params['take_profit_pct'])
+            else:  # Sell
+                position = -1
+                entry_price = current_price
+                stop_loss = entry_price * (1 + params['stop_loss_pct'])
+                take_profit = entry_price * (1 - params['take_profit_pct'])
+
+        elif position != 0:
+            if (position == 1 and (current_price <= stop_loss or current_price >= take_profit)) or \
+               (position == -1 and (current_price >= stop_loss or current_price <= take_profit)):
+                exit_price = current_price
+                pnl = (exit_price - entry_price)/entry_price * capital * position
+                capital += pnl
+                trade_results.append(pnl)
+                position = 0
+
+    return capital, trade_results, data, executed_indices
+
+# Parameters (adjusted for 1h timeframe)
+params = {
+    "symbol": "^GSPC",
+    "ema_short": 7,
+    "ema_long": 30,
+    "rsi_period": 30,
+    "rsi_overbought": 70,
+    "rsi_oversold": 30,
+    "stop_loss_pct": 0.017,
+    "take_profit_pct": 0.01
+}
+
+# Test weeks (now using 1h data)
+test_weeks = [
+    ("2024-01-08", "2024-01-12"),
+    ("2024-03-04", "2024-03-08"),
+    ("2024-05-06", "2024-05-10"),
+    ("2024-08-05", "2024-08-09"),
+    ("2024-10-07", "2024-10-11")
+]
+
+results = []
+all_trades = []
+
+for start, end in test_weeks:
+    try:
+        data = yf.download(
+            params["symbol"],
+            start=start,
+            end=end,
+            interval="1h",  # Changed to 1h
+            auto_adjust=False,
+            timeout=30
+        )
+
+        data = data[data['Volume'] > 0].copy()
+
+        data.reset_index(inplace=True)
+        data.loc[:, 'Datetime'] = pd.to_datetime(data['Datetime'])
+
+
+        capital, trades, data, executed_indices = run_strategy(data, params)
+
+        wins = len([x for x in trades if x > 0])
+        losses = len(trades) - wins
+        total_trades = len(trades)
+        win_rate = wins/total_trades*100 if total_trades > 0 else 0
+        pnl_pct = (capital/10000-1)*100
+
+        results.append({
+            "Week": f"{start} to {end}",
+            "Trades": total_trades,
+            "Wins": wins,
+            "Losses": losses,
+            "Win Rate (%)": f"{win_rate:.1f}",
+            "PnL (%)": f"{pnl_pct:.2f}",
+            "Final Capital": f"${capital:.2f}"
+        })
+
+        all_trades.extend(trades)
+
+    except Exception as e:
+        print(f"Error processing {start}-{end}: {str(e)}")
+        continue
+
+# Results table
+if results:
+    results_df = pd.DataFrame(results)
+    print("\n=== Strategy Performance ===")
+    print(results_df.to_string(index=False))
+
+    if all_trades:
+        total_wins = len([x for x in all_trades if x > 0])
+        total_losses = len(all_trades) - total_wins
+        avg_pnl = np.mean(all_trades)
+        avg_win = np.mean([x for x in all_trades if x > 0]) if total_wins > 0 else 0
+        avg_loss = np.mean([x for x in all_trades if x < 0]) if total_losses > 0 else 0
+        profit_pct = abs(avg_win * total_wins / (avg_loss * total_losses)) if total_losses > 0 else np.inf
+
+        print("\n=== Aggregate Statistics ===")
+        print(f"Total Trades: {len(all_trades)}")
+        print(f"Win Rate: {total_wins/len(all_trades)*100:.1f}%")
+        print(f"Average PnL per Trade: ${avg_pnl:.2f}")
+        print(f"Average Win: ${avg_win:.2f} | Average Loss: ${avg_loss:.2f}")
+        print(f"Profit: {profit_pct:.2f}%")
+        print(f"Max Win: ${max(all_trades):.2f} | Max Loss: ${min(all_trades):.2f}")
+        print(f"Final Portfolio Value: ${10000 + sum(all_trades):.2f}")
+else:
+    print("No results generated - check data availability")
+
+# strategy.py
+import yfinance as yf
+import pandas as pd
+import alpaca_trade_api as tradeapi
+from datetime import datetime, timedelta
+
+# — Alpaca setup —
+API_KEY = 'PKA5IWGKPPJE58XYXWBM'
+API_SECRET = 'ZWZjB196RFGkooFDgfrQb4wJmeY7hIsPdBUmp2hM'
+BASE_URL = 'https://paper-api.alpaca.markets'
+api        = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
+
+# — Strategy parameters —
+SYMBOL         = "SPY"
+EMA_SHORT      = 7
+EMA_LONG       = 30
+RSI_PERIOD     = 14
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD   = 30
+
+# ↓↓↓ MODIFY THESE FOR SL/TP ↓↓↓
+STOP_LOSS_PCT   = 0.017   # e.g. 0.015 = 1.5% stop-loss
+TAKE_PROFIT_PCT = 0.01    # e.g. 0.02  = 2.0% take-profit
+
+
+def fetch_data(symbol,
+               start: str = None,
+               end: str = None,
+               lookback_days: int = 21,
+               interval: str = "1h"):
+    if start and end:
+        df = yf.download(symbol, start=start, end=end, interval=interval)
+    else:
+        now   = datetime.utcnow()
+        start = now - timedelta(days=lookback_days)
+        df = yf.download(symbol,
+                         start=start.strftime("%Y-%m-%d"),
+                         end=now.strftime("%Y-%m-%d"),
+                         interval=interval)
+    df.dropna(inplace=True)
+    return df
+
+
+def calculate_rsi(prices, period):
+    delta = prices.diff()
+    gain  = delta.clip(lower=0).rolling(window=period).mean()
+    loss  = -delta.clip(upper=0).rolling(window=period).mean()
+    rs    = gain / loss
+    return 100 - (100 / (1 + rs))
+
+
+def generate_signal(df):
+    df['EMA_short'] = df['Close'].ewm(span=EMA_SHORT, adjust=False).mean()
+    df['EMA_long']  = df['Close'].ewm(span=EMA_LONG,  adjust=False).mean()
+    df['RSI']       = calculate_rsi(df['Close'], RSI_PERIOD)
+
+    prev = df.iloc[-2]
+    last = df.iloc[-1]
+
+    cross_up   = (prev['EMA_short'] <= prev['EMA_long']).any() and (last['EMA_short'] > last['EMA_long']).any()
+    cross_down = (prev['EMA_short'] >= prev['EMA_long']).any() and (last['EMA_short'] < last['EMA_long']).any()
+
+    rsi_value     = df['RSI'].iloc[-1]
+    rsi_condition = (rsi_value < RSI_OVERSOLD) or (rsi_value > RSI_OVERBOUGHT)
+
+    if cross_up and not rsi_condition:
+        return 'buy'
+    if cross_down and not rsi_condition:
+        return 'sell'
+    return 'hold'
+
+
+def submit_order(signal, dollar_amount=1000):
+    if signal == 'hold':
+        print("No trade signal.")
+        return
+
+    quote = api.get_latest_quote(SYMBOL)
+    price = float(quote.ask_price or quote.bid_price)
+    qty   = round(dollar_amount / price, 3)
+
+    # calculate SL/TP prices
+    if signal == 'buy':
+        sl_price = round(price * (1 - STOP_LOSS_PCT), 2)
+        tp_price = round(price * (1 + TAKE_PROFIT_PCT), 2)
+    else:
+        sl_price = round(price * (1 + STOP_LOSS_PCT), 2)
+        tp_price = round(price * (1 - TAKE_PROFIT_PCT), 2)
+
+    api.submit_order(
+        symbol=SYMBOL,
+        qty=qty,
+        side=signal,
+        type='market',
+        time_in_force='gtc',
+        order_class='bracket',
+        stop_loss={'stop_price': sl_price},
+        take_profit={'limit_price': tp_price}
+    )
+    print(f"{signal.upper()} order: {qty} shares @ ${price:.2f}, SL @ ${sl_price}, TP @ ${tp_price}")
+
+
+
+import time
+from datetime import datetime
+
+def run_hourly_bot():
+    while True:
+        now    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        df     = fetch_data(SYMBOL)
+        signal = generate_signal(df)
+        print(f"[{now}] Signal → {signal}")
+        submit_order(signal)
+        time.sleep(3600)  # wait one hour
+
+if __name__ == "__main__":
+    run_hourly_bot()
+
